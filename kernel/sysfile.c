@@ -334,6 +334,39 @@ sys_open(void)
       return -1;
     }
   }
+  if(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)){
+      int depth = 0;
+      char target[MAXPATH];
+
+      while(ip->type == T_SYMLINK){
+        if(depth >= 10){ // 超过最大递归深度 [cite: 124]
+          iunlockput(ip);
+          end_op();
+          return -1;
+        }
+
+        // 读取符号链接中存储的路径
+        // readi(ip, is_user_dst, dst_addr, offset, length)
+        int len = readi(ip, 0, (uint64)target, 0, MAXPATH);
+        if(len < 0){
+          iunlockput(ip);
+          end_op();
+          return -1;
+        }
+        target[len] = 0; // 确保字符串结束符
+
+        // 释放当前的 inode (符号链接本身)
+        iunlockput(ip); 
+        
+        // 查找目标路径的 inode
+        if((ip = namei(target)) == 0){
+          end_op();
+          return -1; // 目标不存在
+        }
+        ilock(ip); // 锁定新找到的 inode
+        depth++;
+      }
+    }
 
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
     iunlockput(ip);
@@ -501,5 +534,42 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+// sysfile.c
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *ip;
+
+  //获取参数 target (链接指向的目标路径) 和 path (链接本身的路径)
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  //开始事务，因为涉及文件创建
+  begin_op();
+
+  //创建一个新的 inode，类型为 T_SYMLINK
+  // create 函数会处理 namei, allocation 等工作
+  ip = create(path, T_SYMLINK, 0, 0); 
+  if(ip == 0){
+    end_op();
+    return -1;
+  }
+
+  //将 target 路径字符串写入 inode 的数据块中
+  // writei(ip, is_user_src, buffer, offset, length)
+  // is_user_src=0 表示数据在内核空间 (target变量)
+  if(writei(ip, 0, (uint64)target, 0, strlen(target)) != strlen(target)){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  //完成并释放 inode
+  iunlockput(ip);
+  end_op();
   return 0;
 }
