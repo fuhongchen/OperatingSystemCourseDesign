@@ -94,28 +94,66 @@ e1000_init(uint32 *xregs)
 int
 e1000_transmit(char *buf, int len)
 {
-  //
-  // Your code here.
-  //
-  // buf contains an ethernet frame; program it into
-  // the TX descriptor ring so that the e1000 sends it. Stash
-  // a pointer so that it can be freed after send completes.
-  //
-
-  
+  acquire(&e1000_lock);
+  // 获取 TX 环的下一个索引
+  uint32 idx = regs[E1000_TDT];
+  // 检查环是否溢出 (检查 DD 标志位)
+  if((tx_ring[idx].status & E1000_TXD_STAT_DD) == 0){
+    release(&e1000_lock);
+    return -1;
+  }
+  // 如果该位置有旧的缓冲区，释放它
+  if(tx_bufs[idx]){
+    kfree(tx_bufs[idx]);
+    tx_bufs[idx] = 0;
+  }
+  // 将新缓冲区的指针保存起来，以便将来释放
+  tx_bufs[idx] = buf;
+  // 填充描述符
+  tx_ring[idx].addr = (uint64)buf;
+  tx_ring[idx].length = len;
+  // EOP: End of Packet, RS: Report Status (这就让硬件在发完后设置 DD 位)
+  tx_ring[idx].cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+  // 更新 TDT (取模) 
+  regs[E1000_TDT] = (idx + 1) % TX_RING_SIZE;
+  release(&e1000_lock);
   return 0;
 }
 
 static void
 e1000_recv(void)
 {
-  //
-  // Your code here.
-  //
-  // Check for packets that have arrived from the e1000
-  // Create and deliver a buf for each packet (using net_rx()).
-  //
-
+  // 循环处理所有到达的数据包
+  while(1) {
+    // 获取锁以检查环的状态
+    acquire(&e1000_lock);
+    // 获取下一个待处理的接收描述符索引 (RDT + 1)
+    int idx = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+    // 检查 DD 标志位。如果没有设置，说明没有新包，退出循环
+    if((rx_ring[idx].status & E1000_RXD_STAT_DD) == 0){
+      release(&e1000_lock);
+      break; 
+    }
+    // 提取数据包信息
+    // 注意：我们要先把这些信息拿出来，因为马上要重置这个描述符
+    char *buf = rx_bufs[idx];
+    int len = rx_ring[idx].length;
+    // 立即用新的 mbuf/buffer 填补接收环
+    // 这样网卡可以继续接收新的包，而我们可以在没有锁的情况下处理旧包
+    rx_bufs[idx] = kalloc();
+    if(rx_bufs[idx] == 0) {
+      panic("e1000_recv: kalloc failed");
+    }
+    rx_ring[idx].addr = (uint64)rx_bufs[idx];
+    rx_ring[idx].status = 0; // 清除 DD 位，标记为硬件可用
+    // 更新 RDT 指针，告诉硬件这个位置可以用了
+    regs[E1000_RDT] = idx;
+    // 在向上层传递之前释放锁
+    // 防止 net_rx -> net_send -> e1000_transmit 导致的死锁
+    release(&e1000_lock);
+    // 将数据包投递给上层协议栈
+    net_rx(buf, len);
+  }
 }
 
 void

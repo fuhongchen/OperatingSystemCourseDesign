@@ -18,29 +18,59 @@ static uint32 local_ip = MAKE_IP_ADDR(10, 0, 2, 15);
 static uint8 host_mac[ETHADDR_LEN] = { 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 };
 
 static struct spinlock netlock;
-
+/*
 void
 netinit(void)
 {
   initlock(&netlock, "netlock");
-}
+}*/
 
+#define MAX_SOCK 16
+#define RX_QUEUE_SIZE 10
+struct udp_pkt {
+  char *buf;    // 包含以太网首部的原始缓冲区
+  int len;      // 数据包总长度
+};
+struct sock {
+  struct spinlock lock;
+  uint16 dport;           // 绑定的本地端口号（主机字节序）
+  struct udp_pkt queue[RX_QUEUE_SIZE];
+  uint head;
+  uint tail;
+};
+static struct sock sockets[MAX_SOCK];
+void
+netinit(void)
+{
+  initlock(&netlock, "netlock");
+  for(int i = 0; i < MAX_SOCK; i++){
+    initlock(&sockets[i].lock, "sock");
+    sockets[i].dport = 0; // 0 表示该槽位未被使用
+    sockets[i].head = 0;
+    sockets[i].tail = 0;}
+}
 
 //
 // bind(int port)
 // prepare to receive UDP packets address to the port,
 // i.e. allocate any queues &c needed.
 //
-uint64
+int
 sys_bind(void)
 {
-  //
-  // Your code here.
-  //
-
-  return -1;
+  int port;
+  argint(0, &port); // 获取用户传入的端口号
+  for(int i = 0; i < MAX_SOCK; i++){
+    acquire(&sockets[i].lock);
+    if(sockets[i].dport == 0){
+      sockets[i].dport = port;
+      sockets[i].head = 0;
+      sockets[i].tail = 0;
+      release(&sockets[i].lock);
+      return 0;}
+    release(&sockets[i].lock);}
+  return -1; // 无可用槽位
 }
-
 //
 // unbind(int port)
 // release any resources previously created by bind(port);
@@ -71,13 +101,47 @@ sys_unbind(void)
 // dport, *src, and *sport are host byte order.
 // bind(dport) must previously have been called.
 //
-uint64
+int
 sys_recv(void)
 {
-  //
-  // Your code here.
-  //
-  return -1;
+  int dport, maxlen;
+  uint64 psrc, psport, pbuf;
+  struct proc *p = myproc();
+  argint(0, &dport);
+  argaddr(1, &psrc);
+  argaddr(2, &psport);
+  argaddr(3, &pbuf);
+  argint(4, &maxlen);
+  for(int i = 0; i < MAX_SOCK; i++){
+    acquire(&sockets[i].lock);
+    if(sockets[i].dport == dport){// 如果队列为空，则进入休眠状态      
+      while(sockets[i].head == sockets[i].tail){
+        if(p->killed){
+          release(&sockets[i].lock);
+          return -1;}
+        sleep(&sockets[i], &sockets[i].lock);
+      }
+      int idx = sockets[i].head % RX_QUEUE_SIZE;
+      char *buf = sockets[i].queue[idx].buf;
+      sockets[i].head++;
+      release(&sockets[i].lock);
+      struct eth *eth = (struct eth *) buf;
+      struct ip *ip = (struct ip *) (eth + 1);
+      struct udp *udp = (struct udp *) (ip + 1);
+      uint32 src_addr = ntohl(ip->ip_src);
+      uint16 src_port = ntohs(udp->sport);
+      int payload_len = ntohs(udp->ulen) - sizeof(struct udp);
+      if(payload_len > maxlen) payload_len = maxlen; 
+      if(copyout(p->pagetable, psrc, (char *)&src_addr, sizeof(src_addr)) < 0 ||
+         copyout(p->pagetable, psport, (char *)&src_port, sizeof(src_port)) < 0 ||
+         copyout(p->pagetable, pbuf, (char *)(udp + 1), payload_len) < 0){
+        kfree(buf);
+        return -1;
+      }// 使用 copyout 将数据从内核拷贝到用户地址空间
+      kfree(buf); // 释放已处理的数据包缓冲区 
+      return payload_len;}
+    release(&sockets[i].lock);}
+  return -1; // 未找到绑定的端口
 }
 
 // This code is lifted from FreeBSD's ping.c, and is copyright by the Regents
@@ -182,16 +246,34 @@ sys_send(void)
 void
 ip_rx(char *buf, int len)
 {
-  // don't delete this printf; make grade depends on it.
-  static int seen_ip = 0;
-  if(seen_ip == 0)
-    printf("ip_rx: received an IP packet\n");
-  seen_ip = 1;
-
-  //
-  // Your code here.
-  //
-  
+  struct eth *eth = (struct eth *) buf;
+  struct ip *ip = (struct ip *) (eth + 1);
+  // 检查是否为 UDP 协议
+  if(ip->ip_p != IPPROTO_UDP){
+    kfree(buf);
+    return;
+  }
+  struct udp *udp = (struct udp *) (ip + 1);
+  uint16 dport = ntohs(udp->dport); // 转换网络字节序为主机字节序
+  // 寻找绑定的端口
+  for(int i = 0; i < MAX_SOCK; i++){
+    acquire(&sockets[i].lock);
+    if(sockets[i].dport == dport){
+      // 检查队列是否已满
+      if(sockets[i].tail - sockets[i].head < RX_QUEUE_SIZE){
+        int idx = sockets[i].tail % RX_QUEUE_SIZE;
+        sockets[i].queue[idx].buf = buf;
+        sockets[i].queue[idx].len = len;
+        sockets[i].tail++;
+        wakeup(&sockets[i]); // 唤醒正在 sys_recv 中休眠的进程
+        release(&sockets[i].lock);
+        return;
+      }
+    }
+    release(&sockets[i].lock);
+  }
+  // 若未匹配到端口或队列已满，丢弃该包
+  kfree(buf);
 }
 
 //
