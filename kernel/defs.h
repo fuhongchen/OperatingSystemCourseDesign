@@ -67,6 +67,8 @@ void            ramdiskrw(struct buf*);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+char*           superalloc(void);      // 添加这一行
+void            superfree(char* pa);   // 添加这一行
 
 // log.c
 void            initlog(int, struct superblock*);
